@@ -13,7 +13,7 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID")
 
-# ⚠️ ATENÇÃO: ideal é jogar isso pro .env depois e regenerar os tokens
+# ⚠️ Ideal depois é jogar isso pro .env
 ZAPI_INSTANCE_ID = "3EA9E25E43B7E155E1EC324DD30A57B5"
 ZAPI_TOKEN = "86FF22205B06C0F041C0707F"
 ZAPI_CLIENT_TOKEN = "F11bc68dcc0434bb7b87a95abc68507ebS"
@@ -30,8 +30,23 @@ class Prompt(BaseModel):
     question: str
 
 
+# ====== MEMÓRIA POR NÚMERO (THREADS) ======
+PHONE_THREADS: dict[str, str] = {}  # {phone: thread_id}
+
+
+def get_thread_id_for_phone(phone: str) -> str:
+    """Retorna o thread_id para um número. Cria se não existir."""
+    if phone in PHONE_THREADS:
+        return PHONE_THREADS[phone]
+
+    thread = client.beta.threads.create()
+    PHONE_THREADS[phone] = thread.id
+    print(f"Nova thread criada para {phone}: {thread.id}")
+    return thread.id
+
+
 def run_assistant(question: str) -> str:
-    """Roda o assistente da OpenAI e devolve a resposta em texto."""
+    """Versão simples, usada pelo /ask (sem Whats)."""
     thread = client.beta.threads.create()
 
     client.beta.threads.messages.create(
@@ -56,14 +71,45 @@ def run_assistant(question: str) -> str:
 
     messages = client.beta.threads.messages.list(thread_id=thread.id)
     answer = messages.data[0].content[0].text.value
-
     return answer
 
 
+def run_assistant_for_phone(phone: str, question: str) -> str:
+    """Versão com memória por número, usada no WhatsApp."""
+    thread_id = get_thread_id_for_phone(phone)
+
+    # adiciona a nova mensagem na thread
+    client.beta.threads.messages.create(
+        thread_id=thread_id,
+        role="user",
+        content=question
+    )
+
+    # roda o assistente
+    run = client.beta.threads.runs.create(
+        thread_id=thread_id,
+        assistant_id=ASSISTANT_ID,
+    )
+
+    while True:
+        status = client.beta.threads.runs.retrieve(
+            thread_id=thread_id,
+            run_id=run.id
+        )
+        if status.status == "completed":
+            break
+        time.sleep(0.5)
+
+    messages = client.beta.threads.messages.list(thread_id=thread_id)
+    answer = messages.data[0].content[0].text.value
+    return answer
+
+
+# ====== CLASSIFICAÇÃO E PLANILHA ======
+
 def classificar_lead(mensagem: str) -> str:
     """
-    Classificação bem simples só pra começar.
-    Depois podemos melhorar usando a própria IA.
+    Classificação simples só pra filtrar o que cai na planilha.
     """
     texto = (mensagem or "").lower()
 
@@ -82,18 +128,23 @@ def enviar_para_planilha(
     mensagem_recebida: str,
     mensagem_enviada: str,
 ):
-    """Envia os dados do lead para o webhook do Google Sheets."""
+    """Envia os dados do lead para o webhook do Google Sheets, apenas se for lead 'morno' ou 'quente'."""
     status_lead = classificar_lead(mensagem_recebida)
+
+    # Não salva leads frios (só "oi", "blz", etc.)
+    if status_lead == "frio":
+        print("Lead frio, não enviado para planilha.")
+        return
 
     payload = {
         "numero": numero,
-        "nome": "",               # por enquanto deixamos vazio; depois podemos pedir pra IA captar
+        "nome": "",               # depois podemos preencher com ajuda da L.I.A
         "segmento": "",           # idem
         "interesse": "",          # idem
         "mensagemRecebida": mensagem_recebida or "",
         "mensagemEnviada": mensagem_enviada or "",
         "statusLead": status_lead,
-        "objetivo": "",           # podemos usar no futuro
+        "objetivo": "",           # futuro: IA pode extrair isso
         "etapa": "novo",          # etapa inicial
         "observacoes": "Capturado automaticamente pela L.I.A em " + datetime.now().strftime("%d/%m/%Y %H:%M")
     }
@@ -105,6 +156,8 @@ def enviar_para_planilha(
         print("Erro ao enviar lead para planilha:", e)
 
 
+# ====== ENDPOINTS ======
+
 @app.post("/ask")
 def ask_ai(data: Prompt):
     answer = run_assistant(data.question)
@@ -115,9 +168,8 @@ def ask_ai(data: Prompt):
 def whatsapp_webhook(payload: dict):
     """
     Webhook chamado pela Z-API quando chegar mensagem no WhatsApp.
-    Normalmente:
-      - texto vem em payload["text"]["message"]
-      - número vem em payload["phone"]
+      - texto em payload["text"]["message"]
+      - número em payload["phone"]
     """
     print("Webhook recebido:", payload)
 
@@ -125,15 +177,15 @@ def whatsapp_webhook(payload: dict):
     if payload.get("fromMe"):
         return {"status": "ignored"}
 
-    phone = payload.get("phone")
+    phone = str(payload.get("phone") or "")
     text_block = payload.get("text") or {}
     message = text_block.get("message")
 
     if not phone or not message:
         return {"status": "no_text"}
 
-    # gera resposta com a IA
-    answer = run_assistant(message)
+    # gera resposta com a IA (com memória por número)
+    answer = run_assistant_for_phone(phone, message)
 
     # monta chamada para Z-API
     send_url = f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}/token/{ZAPI_TOKEN}/send-text"
@@ -152,10 +204,10 @@ def whatsapp_webhook(payload: dict):
     except Exception as e:
         print("Erro ao enviar mensagem:", e)
 
-    # envia também para a planilha (captura de lead)
+    # registra lead na planilha (somente morno/quente)
     try:
         enviar_para_planilha(
-            numero=str(phone),
+            numero=phone,
             mensagem_recebida=message,
             mensagem_enviada=answer,
         )
