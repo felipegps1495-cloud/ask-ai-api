@@ -2,5 +2,5 @@ fastapi
 uvicorn
 python-dotenv
 openai==1.55.3
-openai
 pydantic
+requests
