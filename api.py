@@ -5,6 +5,7 @@ from openai import OpenAI
 import os
 import time
 import requests
+from datetime import datetime
 
 # Carrega variáveis do .env (uso local)
 load_dotenv()
@@ -12,11 +13,13 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID")
 
-# ⚠️ ATENÇÃO: coloque aqui os dados da SUA instância Z-API
-# (pode pegar na tela "Dados da instância web")
+# ⚠️ ATENÇÃO: ideal é jogar isso pro .env depois e regenerar os tokens
 ZAPI_INSTANCE_ID = "3EA9E25E43B7E155E1EC324DD30A57B5"
 ZAPI_TOKEN = "86FF22205B06C0F041C0707F"
 ZAPI_CLIENT_TOKEN = "F11bc68dcc0434bb7b87a95abc68507ebS"
+
+# Webhook do Google Sheets (Apps Script)
+SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbwAVMCIJNDJ5lP_PanYqD-7YFsY5mXy8TSI11CgvgA6e_Z3VVmzqXTcphFF3t9cO7XG5Q/exec"
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -29,23 +32,19 @@ class Prompt(BaseModel):
 
 def run_assistant(question: str) -> str:
     """Roda o assistente da OpenAI e devolve a resposta em texto."""
-    # cria thread
     thread = client.beta.threads.create()
 
-    # envia pergunta
     client.beta.threads.messages.create(
         thread_id=thread.id,
         role="user",
         content=question
     )
 
-    # roda o assistente
     run = client.beta.threads.runs.create(
         thread_id=thread.id,
         assistant_id=ASSISTANT_ID,
     )
 
-    # espera terminar
     while True:
         status = client.beta.threads.runs.retrieve(
             thread_id=thread.id,
@@ -55,11 +54,55 @@ def run_assistant(question: str) -> str:
             break
         time.sleep(0.5)
 
-    # pega resposta
     messages = client.beta.threads.messages.list(thread_id=thread.id)
     answer = messages.data[0].content[0].text.value
 
     return answer
+
+
+def classificar_lead(mensagem: str) -> str:
+    """
+    Classificação bem simples só pra começar.
+    Depois podemos melhorar usando a própria IA.
+    """
+    texto = (mensagem or "").lower()
+
+    palavras_quente = ["preço", "valor", "quanto", "custa", "investimento", "fechar", "contratar", "quero o bot"]
+    palavras_morno = ["como funciona", "explica", "explicar", "saber mais", "informação", "interesse"]
+
+    if any(p in texto for p in palavras_quente):
+        return "quente"
+    if any(p in texto for p in palavras_morno):
+        return "morno"
+    return "frio"
+
+
+def enviar_para_planilha(
+    numero: str,
+    mensagem_recebida: str,
+    mensagem_enviada: str,
+):
+    """Envia os dados do lead para o webhook do Google Sheets."""
+    status_lead = classificar_lead(mensagem_recebida)
+
+    payload = {
+        "numero": numero,
+        "nome": "",               # por enquanto deixamos vazio; depois podemos pedir pra IA captar
+        "segmento": "",           # idem
+        "interesse": "",          # idem
+        "mensagemRecebida": mensagem_recebida or "",
+        "mensagemEnviada": mensagem_enviada or "",
+        "statusLead": status_lead,
+        "objetivo": "",           # podemos usar no futuro
+        "etapa": "novo",          # etapa inicial
+        "observacoes": "Capturado automaticamente pela L.I.A em " + datetime.now().strftime("%d/%m/%Y %H:%M")
+    }
+
+    try:
+        r = requests.post(SHEETS_WEBHOOK_URL, json=payload, timeout=10)
+        print("Lead enviado para planilha:", r.status_code, r.text)
+    except Exception as e:
+        print("Erro ao enviar lead para planilha:", e)
 
 
 @app.post("/ask")
@@ -102,10 +145,21 @@ def whatsapp_webhook(payload: dict):
         "Client-Token": ZAPI_CLIENT_TOKEN
     }
 
+    # envia resposta pro WhatsApp
     try:
         r = requests.post(send_url, json=body, headers=headers, timeout=10)
         print("Resposta enviada:", r.status_code, r.text)
     except Exception as e:
         print("Erro ao enviar mensagem:", e)
 
+    # envia também para a planilha (captura de lead)
+    try:
+        enviar_para_planilha(
+            numero=str(phone),
+            mensagem_recebida=message,
+            mensagem_enviada=answer,
+        )
+    except Exception as e:
+        print("Erro ao registrar lead:", e)
 
+    return {"status": "ok"}
