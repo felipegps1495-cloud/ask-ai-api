@@ -6,6 +6,8 @@ import os
 import time
 import requests
 from datetime import datetime
+import json
+import re
 
 # Carrega variáveis do .env (uso local)
 load_dotenv()
@@ -105,48 +107,71 @@ def run_assistant_for_phone(phone: str, question: str) -> str:
     return answer
 
 
-# ====== CLASSIFICAÇÃO E PLANILHA ======
+# ====== SEPARAR TEXTO E JSON DA RESPOSTA ======
 
-def classificar_lead(mensagem: str) -> str:
+def extrair_resposta_e_json(answer: str):
     """
-    Classificação simples só pra filtrar o que cai na planilha.
+    Espera um formato:
+
+    RESPOSTA_WHATSAPP:
+    ...texto...
+
+    LEAD_JSON:
+    {...}
     """
-    texto = (mensagem or "").lower()
+    if "LEAD_JSON:" not in answer:
+        # fallback: não veio no formato esperado
+        return answer.strip(), {}
 
-    palavras_quente = ["preço", "valor", "quanto", "custa", "investimento", "fechar", "contratar", "quero o bot"]
-    palavras_morno = ["como funciona", "explica", "explicar", "saber mais", "informação", "interesse"]
+    parte_texto, parte_json = answer.split("LEAD_JSON:", 1)
+    resposta_whats = parte_texto.replace("RESPOSTA_WHATSAPP:", "").strip()
 
-    if any(p in texto for p in palavras_quente):
-        return "quente"
-    if any(p in texto for p in palavras_morno):
-        return "morno"
-    return "frio"
+    # limpa possíveis crases ou markdown
+    json_str = parte_json.strip()
+    json_str = re.sub(r"^```(json)?", "", json_str).strip()
+    json_str = re.sub(r"```$", "", json_str).strip()
 
+    try:
+        lead_data = json.loads(json_str)
+    except Exception as e:
+        print("Erro ao fazer parse do LEAD_JSON:", e, "conteúdo:", json_str)
+        lead_data = {}
+
+    return resposta_whats, lead_data
+
+
+# ====== ENVIO PARA PLANILHA ======
 
 def enviar_para_planilha(
     numero: str,
     mensagem_recebida: str,
     mensagem_enviada: str,
+    lead_data: dict,
 ):
-    """Envia os dados do lead para o webhook do Google Sheets, apenas se for lead 'morno' ou 'quente'."""
-    status_lead = classificar_lead(mensagem_recebida)
+    """
+    Envia os dados do lead para o webhook do Google Sheets.
+    Usa os campos do LEAD_JSON retornado pela L.I.A.
+    Só envia se statusLead for 'morno' ou 'quente'.
+    """
+    status_lead = (lead_data.get("statusLead") or "").lower()
 
-    # Não salva leads frios (só "oi", "blz", etc.)
-    if status_lead == "frio":
-        print("Lead frio, não enviado para planilha.")
+    # Não salva leads frios ou sem classificação
+    if status_lead not in ["morno", "quente"]:
+        print("Lead frio ou sem status, não enviado para planilha.")
         return
 
     payload = {
         "numero": numero,
-        "nome": "",               # depois podemos preencher com ajuda da L.I.A
-        "segmento": "",           # idem
-        "interesse": "",          # idem
+        "nome": lead_data.get("nome", ""),
+        "segmento": lead_data.get("segmento", ""),
+        "interesse": lead_data.get("interesse", ""),
         "mensagemRecebida": mensagem_recebida or "",
         "mensagemEnviada": mensagem_enviada or "",
-        "statusLead": status_lead,
-        "objetivo": "",           # futuro: IA pode extrair isso
-        "etapa": "novo",          # etapa inicial
-        "observacoes": "Capturado automaticamente pela L.I.A em " + datetime.now().strftime("%d/%m/%Y %H:%M")
+        "statusLead": lead_data.get("statusLead", ""),
+        "objetivo": lead_data.get("objetivo", ""),
+        "etapa": lead_data.get("etapa", "novo"),
+        "observacoes": "Capturado automaticamente pela L.I.A em "
+        + datetime.now().strftime("%d/%m/%Y %H:%M"),
     }
 
     try:
@@ -185,13 +210,16 @@ def whatsapp_webhook(payload: dict):
         return {"status": "no_text"}
 
     # gera resposta com a IA (com memória por número)
-    answer = run_assistant_for_phone(phone, message)
+    resposta_completa = run_assistant_for_phone(phone, message)
+
+    # separa a parte que vai pro Whats e o JSON de lead
+    resposta_whats, lead_data = extrair_resposta_e_json(resposta_completa)
 
     # monta chamada para Z-API
     send_url = f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}/token/{ZAPI_TOKEN}/send-text"
     body = {
         "phone": phone,
-        "message": answer,
+        "message": resposta_whats,
     }
     headers = {
         "Client-Token": ZAPI_CLIENT_TOKEN
@@ -204,12 +232,13 @@ def whatsapp_webhook(payload: dict):
     except Exception as e:
         print("Erro ao enviar mensagem:", e)
 
-    # registra lead na planilha (somente morno/quente)
+    # registra lead na planilha (se LEAD_JSON vier preenchido como morno/quente)
     try:
         enviar_para_planilha(
             numero=phone,
             mensagem_recebida=message,
-            mensagem_enviada=answer,
+            mensagem_enviada=resposta_whats,
+            lead_data=lead_data,
         )
     except Exception as e:
         print("Erro ao registrar lead:", e)
