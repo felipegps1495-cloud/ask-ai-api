@@ -16,6 +16,7 @@ ASSISTANT_ID = os.getenv("ASSISTANT_ID")
 # (pode pegar na tela "Dados da instância web")
 ZAPI_INSTANCE_ID = "3EA9E25E43B7E155E1EC324DD30A57B5"
 ZAPI_TOKEN = "86FF22205B06C0F041C0707F"
+ZAPI_CLIENT_TOKEN = "F11bc68dcc0434bb7b87a95abc68507ebS"
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -92,3 +93,19 @@ def whatsapp_webhook(payload: dict):
     answer = run_assistant(message)
 
     # monta chamada para Z-API
+    send_url = f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}/token/{ZAPI_TOKEN}/send-text"
+    body = {
+        "phone": phone,
+        "message": answer,
+    }
+    headers = {
+        "Client-Token": ZAPI_CLIENT_TOKEN
+    }
+
+    try:
+        r = requests.post(send_url, json=body, headers=headers, timeout=10)
+        print("Resposta enviada:", r.status_code, r.text)
+    except Exception as e:
+        print("Erro ao enviar mensagem:", e)
+
+
